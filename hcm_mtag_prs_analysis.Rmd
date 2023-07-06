@@ -1,0 +1,1004 @@
+---
+title: "HCM PRS analysis"
+author: "Sean L Zheng"
+date: "05/11/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/Volumes/RDS/project/lms-ware-analysis/live/sean")
+```
+
+##Set environment, load in and merge files
+
+Load in libraries 
+```{r Load libraries, echo=FALSE, message=FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(plyr)
+library(aod)
+library(Hmisc)
+#library(ggstatsplot)
+library(epiR)
+library("survival")
+library("survminer")
+library(ggpubr)
+library(broom)
+library(rstatix)
+```
+
+Set variable names
+```{r Set variable names, echo=FALSE, message=FALSE, warning=FALSE}
+phenotype = 'HCM.MTAG' #or HCM
+ukb_mtag = TRUE
+variant_type = 'hcm_kathryn.plp_sample'
+mybpc3_status <- 'exc.MYBPC3' #or leave empty
+prscs_method <- '1KG.LD' #UKBB.LD, 1KG
+```
+
+Load in files and clean up
+```{r Load data files, echo=FALSE, message=FALSE, warning=FALSE}
+setwd("/Volumes/RDS/project/lms-ware-analysis/live/sean")
+
+PRS = fread(paste('prs/PRScs/HCM/output/scores/PRScs.',phenotype,'.exc.MYBPC3.UKBB.',prscs_method,'.profile',sep=''), select=c('FID','IID','SCORE'), col.names=c('FID','IID','PRS') )
+
+#Load files
+pheno_file <- fread('Sample_Phenotype_Files/hf_with_cov.pheno') #binary phenotype files
+clinical <- fread('ukbb_outcomes/mace_500k.txt') #clinical outcomes
+rare_var <- fread('UKBB_WES/UKB_450K_rare_variant_status_update.txt')
+rare_var[[variant_type]] <- as.factor(rare_var[[variant_type]])
+imaging <- fread('hcm/mace_cmr_fd_ukbb_40k_clean_recruit.txt') #imaging data
+imaging <- imaging[,c(245,143:242,246:252)]
+
+#merge datasets
+data <- merge(PRS, pheno_file, by=c('IID','FID'), all=FALSE)
+data$hcm <- as.factor(data$hcm)
+data$dcm <- as.factor(data$dcm)
+data <- merge(data, clinical, by.x='IID', by.y ='eid', all=F)
+
+#add column for time to HCM
+data$event_hcm <- ifelse(data$hcm == 2 & data$event_cardiomyopathy_pooled == 2, 2, ifelse(data$hcm == 2 & data$event_cardiomyopathy_pooled == 1, -9, 1))
+data$time_hcm <- ifelse(data$event_hcm == 1, data$time_cardiomyopathy_pooled, data$time_censor)
+
+if (ukb_mtag == TRUE) {data <- data %>% filter(!IID %in% imaging$IID)}
+```
+
+Set quantiles
+```{r Set quantiles, echo=FALSE, message=FALSE, warning=FALSE}
+#Quantiles#### RUN THIS SECTION EVERY TIME YOU WANT TO CHANGE THE QUANTILES - NOTE it should be run at this stage to ensure that the binning is done in the entire population rather
+quantiles <- 10
+
+data$quantile <- ntile(data$PRS, quantiles) #group individuals into quantiles
+
+for (i in 1:quantiles){
+  col_name<- paste("quantile_",i,sep='')
+  data[[col_name]] <- ifelse(data$quantile == i, 1, 0)
+}
+
+#save thresholds (centiles)
+setwd('/Volumes/RDS/project/lms-ware-analysis/live/sean')
+test = data
+test$quantile = ntile(test$PRS, 100)
+
+quantile_table = data.frame(matrix(ncol=2, nrow=100))
+colnames(quantile_table) <- c('Centile','PGS_Threshold')
+for (i in 1:quantiles){
+  quantile_table[i,] <- c(i, max((test %>% filter(quantile == i))$PRS))
+}
+fwrite(quantile_table, paste('prs/PRScs/HCM/output/scores/PRScs.',phenotype,'.exc.MYBPC3.UKBB.',prscs_method,'.thresholds',sep=''), sep='\t')
+rm(test)
+rm(quantile_table)
+```
+
+Merge various files
+```{r Merge files, echo=FALSE, message=FALSE, warning=FALSE}
+#create rare_var dataset for subgroup analysis
+rare_var_data <- merge(data, rare_var, by='IID')
+rare_var_plp <- rare_var_data %>% filter(rare_var_data[[variant_type]] == 1) #filter only SARCPLP positive carriers
+rare_var_neg <- rare_var_data %>% filter(rare_var_data[[variant_type]] == 0) #filter only SARCPLP negative
+
+rm(pheno_file)
+rm(clinical)
+rm(rare_var)
+rm(imaging)
+```
+
+##Plotting PGS distributions
+Plot publication ready distribution curves and test if there is a difference between means
+```{r Plot distribution stratified by case status, echo=FALSE, message=FALSE, warning=FALSE, fig.height=8, fig.width=8}
+df_list = list(data, rare_var_data, rare_var_plp, rare_var_neg)
+names(df_list) <- c( substitute(data), substitute(rare_var_data), substitute(rare_var_plp), substitute(rare_var_neg))
+
+for (i in 1:length(df_list)){
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+ggplot(dataset, aes(x=dataset$PRS)) + geom_density() +   
+  xlab('PRS') +
+  theme_classic() +
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank())#all PRS scores
+
+#PRS distribution stratified by case-control
+dataset = data
+outcome='hcm'
+dataset$pheno <- ifelse(dataset[[outcome]] == 1, 'Yes', 'No')
+means <- ddply(dataset, 'pheno', summarise, PRS.mean=mean(dataset$PRS)) #calculate matrix of mean scores for each group
+means[1,2]<- mean((dataset %>% filter(pheno=='No'))$PRS)
+means[2,2]<- mean((dataset %>% filter(pheno=='Yes'))$PRS)
+
+plot = ggplot(dataset, aes(x=dataset$PRS, fill=pheno)) + 
+  geom_density(alpha=.75) +
+  scale_fill_manual(values=c("#a1d99b", "#006d2c")) +
+  geom_vline(data=means, aes(xintercept=PRS.mean,  colour=pheno), linetype="dashed", size=1, show.legend=F) + #stratified by phenotype status
+  scale_color_manual(values=c("#a1d99b", "#006d2c")) +
+  theme_classic() +
+  xlab('PRS') +
+  theme(legend.position='bottom') +
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.x = element_text(size=16),
+        legend.title = element_text (size=16),
+        legend.text = element_text (size=14)) +
+  guides(fill=guide_legend(title='HCM'))
+
+print(plot)
+
+#statistical test between means
+print(t.test((dataset %>% filter(dataset[[outcome]] == 1))$PRS, (dataset %>% filter(dataset[[outcome]] == 0))$PRS, alternative='two.sided',var.equal=TRUE))
+
+}
+```
+
+Plot publication ready distribution curves stratified by sarcomere status and test if there is a difference between means
+```{r Plot distribution stratified by sarcomere status, echo=FALSE, message=FALSE, warning=FALSE, fig.height=8, fig.width=8, message=FALSE, warning=FALSE}
+#plot stratified by sarc status
+dataset = rare_var_data
+outcome='hcm'
+rare_var_data$geno <- ifelse(rare_var_data[[variant_type]] == 1, 'Yes', 'No')
+means <- ddply(rare_var_data, 'geno', summarise, PRS.mean=mean(PRS)) #calculate matrix of mean scores for each group
+means[1,2]<- mean((rare_var_data %>% filter(geno=='No'))$PRS)
+means[2,2]<- mean((rare_var_data %>% filter(geno=='Yes'))$PRS)
+
+plot = ggplot(rare_var_data, aes(x=rare_var_data$PRS, fill=geno)) + 
+  geom_density(alpha=.75) +
+  scale_fill_manual(values=c("grey", "darkred")) +
+  geom_vline(data=means, aes(xintercept=PRS.mean,  colour=geno), linetype="dashed", size=1, show.legend=F) + #stratified by phenotype status
+  scale_color_manual(values=c("grey", "darkred")) +
+  theme_classic() +
+  xlab('PRS') +
+  theme(legend.position='bottom') +
+  theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.title.x = element_text(size=16),
+        legend.title = element_text (size=16),
+        legend.text = element_text (size=14)) +
+  guides(fill=guide_legend(title='SARC-PLP'))
+
+print(plot)
+
+#statistical test between means
+print(t.test((dataset %>% filter(dataset[[variant_type]] == 1))$PRS, (dataset %>% filter(dataset[[variant_type]] == 0))$PRS, alternative='two.sided',var.equal=TRUE))
+
+```
+
+##Prevalence and OR by quantile bins
+```{r Prevalence by quantile bins, echo=FALSE, fig.height=8, fig.width=8}
+df_list = list(data, rare_var_data, rare_var_plp, rare_var_neg)
+names(df_list) <- c( substitute(data), substitute(rare_var_data), substitute(rare_var_plp), substitute(rare_var_neg))
+outcome = 'hcm'
+
+for (i in 1:length(df_list)){
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+
+table <- data.frame(matrix(ncol = 3, nrow = quantiles))
+colnames(table) <- c('percentile','case','control')
+for (j in 1:quantiles){
+  table[j,] <- c(j, nrow(dataset %>% filter(dataset[[outcome]]==1 & quantile==j)), nrow(dataset %>% filter(dataset[[outcome]]==0 & quantile==j)))
+}
+
+table1 <- as.matrix(table)
+table2 <- epi.conf(table1[,2:3], ctype = "prevalence", method = "exact", N = 1000, design = 1, 
+                   conf.level = 0.95) * 1000
+table2$quantiles <- 1:quantiles
+
+plot = ggplot(data=table2, aes(x=quantiles, y=est)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.25) +
+  geom_point(size=2.5) +
+  scale_y_continuous(name=paste(outcome,' Prevalence (cases per 1000 individuals at risk)', sep='')) +
+  scale_x_continuous(name='PGS quantile', breaks=1:quantiles) +
+  theme_classic() +
+  theme(axis.text=element_text(size=14),
+        axis.title = element_text(size=16))
+
+print(plot)
+}
+```
+
+```{r OR vs. middle quintile, echo=FALSE, fig.height=8, fig.width=8}
+df_list = list(data, rare_var_data, rare_var_plp, rare_var_neg)
+names(df_list) <- c( substitute(data), substitute(rare_var_data), substitute(rare_var_plp), substitute(rare_var_neg))
+outcome = 'hcm'
+
+for (i in 1:length(df_list)){
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+#comparing all quantiles with the middle quantile
+variables <- c('quantile_1','quantile_2','quantile_3','quantile_4','quantile_7','quantile_8','quantile_9','quantile_10','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5','pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+
+mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+summary(mylogit)
+
+estimates = as.data.frame(summary(mylogit)$coefficients[2:9,1:2])
+estimates$OR = exp(estimates[,'Estimate'])
+estimates$LCI = exp(estimates[,'Estimate']-(1.96*estimates[,'Std. Error']))
+estimates$UCI = exp(estimates[,'Estimate']+(1.96*estimates[,'Std. Error']))
+
+estimates <- estimates[c('quantile_1', 'quantile_2', 'quantile_3', 'quantile_4', 10 ,10, 'quantile_7', 'quantile_8', 'quantile_9', 'quantile_10'),]
+estimates[5:6,]=c(1,1,1,1,1)
+estimates$quantiles <- 1:quantiles
+estimates[,1:2] = NULL
+colnames(estimates) <- c('OR', 'LCI', 'UCI', 'quantiles')
+
+plot = ggplot(data=estimates, aes(x=quantiles, y=OR)) +
+  geom_errorbar(aes(ymin=LCI, ymax=UCI), width=0.25) +
+  geom_point(size=2.5) +
+  scale_y_continuous(name='Odds Ratio for HCM', breaks=1:100) +
+  scale_x_continuous(name='PRS Quantile', breaks=1:quantiles) +
+  theme_classic() +
+  theme(axis.text=element_text(size=14),
+        axis.title = element_text(size=16)) +
+  geom_hline(yintercept=1,linetype=2)
+
+print(plot)
+}
+```
+
+```{r OR vs. bottom quantile, echo=FALSE, fig.height=8, fig.width=8}
+df_list = list(data, rare_var_data, rare_var_plp, rare_var_neg)
+names(df_list) <- c( substitute(data), substitute(rare_var_data), substitute(rare_var_plp), substitute(rare_var_neg))
+outcome = 'hcm'
+
+for (i in 1:length(df_list)){
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+#comparing all quantiles with a the bottom quintile
+variables <- c('quantile_2','quantile_3','quantile_4','quantile_5','quantile_6','quantile_7','quantile_8','quantile_9','quantile_10','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5','pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+
+mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+summary(mylogit)
+
+estimates = as.data.frame(summary(mylogit)$coefficients[2:10,1:2])
+estimates$OR = exp(estimates[,'Estimate'])
+estimates$LCI = exp(estimates[,'Estimate']-(1.96*estimates[,'Std. Error']))
+estimates$UCI = exp(estimates[,'Estimate']+(1.96*estimates[,'Std. Error']))
+
+estimates <- estimates[c(10, 'quantile_2', 'quantile_3', 'quantile_4', 'quantile_5' ,'quantile_6', 'quantile_7', 'quantile_8', 'quantile_9', 'quantile_10'),]
+estimates[1,]=c(1,1,1,1,1)
+estimates$quantiles <- 1:quantiles
+estimates[,1:2] = NULL
+colnames(estimates) <- c('OR', 'LCI', 'UCI', 'quantiles')
+
+plot = ggplot(data=estimates, aes(x=quantiles, y=OR)) +
+  geom_errorbar(aes(ymin=LCI, ymax=UCI), width=0.25) +
+  geom_point(size=2.5) +
+  scale_y_continuous(name='Odds Ratio for HCM', breaks=1:100) +
+  scale_x_continuous(name='PRS Quantile', breaks=1:quantiles) +
+  theme_classic() +
+  theme(axis.text=element_text(size=14),
+        axis.title = element_text(size=16)) +
+  geom_hline(yintercept=1,linetype=2)
+
+print(plot)
+}
+```
+
+```{r Prevalence in unequal bin sizes, echo=FALSE, fig.height=8, fig.width=8}
+df_list = list(data, rare_var_data, rare_var_neg)
+names(df_list) <- c( substitute(data), substitute(rare_var_data), substitute(rare_var_neg))
+outcome = 'hcm'
+
+for (i in 1:length(df_list)) {
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+quantiles <- 100
+dataset$quantile <- ntile(dataset$PRS, quantiles) #group individuals into quantiles
+
+dataset$quantile0_1 = ifelse(dataset$quantile <=1, 1, 0)
+dataset$quantile1_5 = ifelse(dataset$quantile >1 & dataset$quantile <=5, 1, 0)
+dataset$quantile5_10= ifelse(dataset$quantile >5 & dataset$quantile <=10, 1, 0)
+dataset$quantile10_20= ifelse(dataset$quantile >10 & dataset$quantile <=20, 1, 0)
+dataset$quantile20_40= ifelse(dataset$quantile >20 & dataset$quantile <=40, 1, 0)
+dataset$quantile40_60= ifelse(dataset$quantile >40 & dataset$quantile <=60, 1, 0)
+dataset$quantile60_80= ifelse(dataset$quantile >60 & dataset$quantile <=80, 1, 0)
+dataset$quantile80_90= ifelse(dataset$quantile >80 & dataset$quantile <=90, 1, 0)
+dataset$quantile90_95= ifelse(dataset$quantile >90 & dataset$quantile <=95, 1, 0)
+dataset$quantile95_99= ifelse(dataset$quantile >95 & dataset$quantile <=99, 1, 0)
+dataset$quantile99_100 = ifelse(dataset$quantile >99, 1, 0)
+
+table <- data.frame(matrix(ncol = 3, nrow = 11))
+colnames(table) <- c('percentile','case','control')
+quantile_cols <- c('quantile0_1','quantile1_5','quantile5_10','quantile10_20','quantile20_40','quantile40_60','quantile60_80','quantile80_90','quantile90_95','quantile95_99','quantile99_100')
+
+for (i in 1:length(quantile_cols)){
+  table[i,] <- c(i, as.numeric(nrow(dataset %>% filter(dataset[[quantile_cols[i]]]==1 & dataset[[outcome]]==1))), as.numeric(nrow(dataset %>% filter(dataset[[quantile_cols[i]]]==1 & dataset[[outcome]]==0))))
+}
+
+table1 <- as.matrix(table)
+table2 <- epi.conf(table1[,2:3], ctype = "prevalence", method = "exact", N = 1000, design = 1, 
+                   conf.level = 0.95) * 1000
+table2$quantiles <- 1:11
+
+plot = ggplot(data=table2, aes(x=quantiles, y=est)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.25) +
+  geom_point(size=2.5) +
+  scale_y_continuous(name='HCM Prevalence (cases per 1000 individuals at risk)', breaks = c(2,4,6,8,10,12,14,16)) +
+  scale_x_continuous(name='PRS quantile', breaks=c(1:100)) +
+  theme_classic() +
+  theme(axis.text=element_text(size=14),
+        axis.title = element_text(size=16))
+
+print(plot)
+}
+```
+
+```{r OR in unequal bin sizes compared with middle, echo=FALSE, fig.height=8, fig.width=8}
+
+df_list = list(data, rare_var_data, rare_var_plp, rare_var_neg)
+names(df_list) <- c( substitute(data), substitute(rare_var_data), substitute(rare_var_plp), substitute(rare_var_neg))
+outcome = 'hcm'
+
+for (i in 1:length(df_list)) {
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+quantiles <- 100
+dataset$quantile <- ntile(dataset$PRS, quantiles) #group individuals into quantiles
+
+dataset$quantile0_1 = ifelse(dataset$quantile <=1, 1, 0)
+dataset$quantile1_5 = ifelse(dataset$quantile >1 & dataset$quantile <=5, 1, 0)
+dataset$quantile5_10= ifelse(dataset$quantile >5 & dataset$quantile <=10, 1, 0)
+dataset$quantile10_20= ifelse(dataset$quantile >10 & dataset$quantile <=20, 1, 0)
+dataset$quantile20_40= ifelse(dataset$quantile >20 & dataset$quantile <=40, 1, 0)
+dataset$quantile40_60= ifelse(dataset$quantile >40 & dataset$quantile <=60, 1, 0)
+dataset$quantile60_80= ifelse(dataset$quantile >60 & dataset$quantile <=80, 1, 0)
+dataset$quantile80_90= ifelse(dataset$quantile >80 & dataset$quantile <=90, 1, 0)
+dataset$quantile90_95= ifelse(dataset$quantile >90 & dataset$quantile <=95, 1, 0)
+dataset$quantile95_99= ifelse(dataset$quantile >95 & dataset$quantile <=99, 1, 0)
+dataset$quantile99_100 = ifelse(dataset$quantile >99, 1, 0)
+
+variables <- c('quantile0_1','quantile1_5','quantile5_10','quantile10_20','quantile20_40','quantile60_80','quantile80_90','quantile90_95','quantile95_99','quantile99_100','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5','pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+summary(mylogit)
+
+estimates = as.data.frame(summary(mylogit)$coefficients[2:11,1:2])
+estimates$OR = exp(estimates[,'Estimate'])
+estimates$LCI = exp(estimates[,'Estimate']-(1.96*estimates[,'Std. Error']))
+estimates$UCI = exp(estimates[,'Estimate']+(1.96*estimates[,'Std. Error']))
+
+
+estimates <- estimates[c('quantile0_1','quantile1_5','quantile5_10','quantile10_20','quantile20_40',10,'quantile60_80','quantile80_90','quantile90_95','quantile95_99','quantile99_100'),]
+estimates[6,]=c(1,1,1,1,1)
+estimates$quantiles <- 1:11
+estimates[,1:2] = NULL
+colnames(estimates) <- c('OR', 'LCI', 'UCI', 'quantiles')
+
+knitr::kable(estimates, caption = 'OR in unequal bin sizes compared with middle')
+
+plot = ggplot(data=estimates, aes(x=quantiles, y=OR)) +
+  geom_errorbar(aes(ymin=LCI, ymax=UCI), width=0.25) +
+  geom_point(size=2.5) +
+  scale_y_continuous(name='Odds Ratio for HCM', breaks=1:100) +
+  scale_x_continuous(name='PGS Quantile', breaks=1:quantiles) +
+  theme_classic() +
+  theme(axis.text=element_text(size=14),
+        axis.title = element_text(size=16)) +
+  geom_hline(yintercept=1,linetype=2)
+
+print(plot)
+}
+
+```
+
+```{r OR in unequal bin sizes compared with bottom, echo=FALSE, fig.height=8, fig.width=8}
+
+df_list = list(data, rare_var_data, rare_var_neg)
+names(df_list) <- c( substitute(data), substitute(rare_var_data), substitute(rare_var_neg))
+outcome = 'hcm'
+
+for (i in 1:length(df_list)) {
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+quantiles <- 100
+dataset$quantile <- ntile(dataset$PRS, quantiles) 
+
+dataset$quantile0_1 = ifelse(dataset$quantile <=1, 1, 0)
+dataset$quantile1_5 = ifelse(dataset$quantile >1 & dataset$quantile <=5, 1, 0)
+dataset$quantile5_10= ifelse(dataset$quantile >5 & dataset$quantile <=10, 1, 0)
+dataset$quantile10_20= ifelse(dataset$quantile >10 & dataset$quantile <=20, 1, 0)
+dataset$quantile20_40= ifelse(dataset$quantile >20 & dataset$quantile <=40, 1, 0)
+dataset$quantile40_60= ifelse(dataset$quantile >40 & dataset$quantile <=60, 1, 0)
+dataset$quantile60_80= ifelse(dataset$quantile >60 & dataset$quantile <=80, 1, 0)
+dataset$quantile80_90= ifelse(dataset$quantile >80 & dataset$quantile <=90, 1, 0)
+dataset$quantile90_95= ifelse(dataset$quantile >90 & dataset$quantile <=95, 1, 0)
+dataset$quantile95_99= ifelse(dataset$quantile >95 & dataset$quantile <=99, 1, 0)
+dataset$quantile99_100 = ifelse(dataset$quantile >99, 1, 0)
+
+variables <- c('quantile1_5','quantile5_10','quantile10_20','quantile20_40','quantile40_60','quantile60_80','quantile80_90','quantile90_95','quantile95_99','quantile99_100','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5','pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+summary(mylogit)
+
+estimates = as.data.frame(summary(mylogit)$coefficients[2:11,1:2])
+estimates$OR = exp(estimates[,'Estimate'])
+estimates$LCI = exp(estimates[,'Estimate']-(1.96*estimates[,'Std. Error']))
+estimates$UCI = exp(estimates[,'Estimate']+(1.96*estimates[,'Std. Error']))
+
+
+estimates <- estimates[c(10,'quantile1_5','quantile5_10','quantile10_20','quantile20_40','quantile40_60','quantile60_80','quantile80_90','quantile90_95','quantile95_99','quantile99_100'),]
+estimates[1,]=c(1,1,1,1,1)
+estimates$quantiles <- 1:11
+estimates[,1:2] = NULL
+colnames(estimates) <- c('OR', 'LCI', 'UCI', 'quantiles')
+
+knitr::kable(estimates, caption= 'OR in unequal bin sizes compared with bottom')
+
+plot = ggplot(data=estimates, aes(x=quantiles, y=OR)) +
+  geom_errorbar(aes(ymin=LCI, ymax=UCI), width=0.25) +
+  geom_point(size=2.5) +
+  scale_y_continuous(name='Odds Ratio for HCM', breaks=1:100) +
+  scale_x_continuous(name='PGS Quantile', breaks=1:quantiles) +
+  theme_classic() +
+  theme(axis.text=element_text(size=14),
+        axis.title = element_text(size=16)) +
+  geom_hline(yintercept=1,linetype=2)
+
+print(plot)
+}
+```
+
+##Plot the cumulative incidence of HCM by quantile
+```{r Cumulative incidence curves, echo=FALSE, fig.height=8, fig.width=8}
+#make sure that it is requantiled to 100
+data2 = data
+quantiles <- 100
+data2$quantile <- ntile(data2$PRS, quantiles) 
+imaging_data2 <- merge(data2, imaging, by='IID')
+#create rare_var dataset for subgroup analysis
+rare_var_data2 <- merge(data2, rare_var, by='IID')
+rare_var_plp2 <- rare_var_data2 %>% filter(rare_var_data2[[variant_type]] == 1) #filter only SARCPLP positive carriers
+rare_var_neg2 <- rare_var_data2 %>% filter(rare_var_data2[[variant_type]] == 0) #filter only SARCPLP negative
+
+df_list = list(data2, rare_var_data2, rare_var_plp2, rare_var_neg2)
+names(df_list) <- c( substitute(data2), substitute(rare_var_data2), substitute(rare_var_plp2), substitute(rare_var_neg2))
+outcome = 'hcm'
+
+for (j in 1:length(df_list)){
+dataset <- df_list[[j]]
+print(names(df_list[j]))
+
+table2 <- data.frame(matrix(ncol = 7, nrow = quantiles))
+
+for (i in 1:quantiles){
+  if (i == 1){table2[i,1:5] <- c(i, 
+                             nrow(dataset %>% filter(quantile==i,dataset[[outcome]]==1)), 
+                             nrow(dataset %>% filter(quantile==i)), 
+                             nrow(dataset %>% filter(quantile==i,dataset[[outcome]]==1)), 
+                             nrow(dataset %>% filter(quantile==i)))}
+  if (i != 1){table2[i,1:3] = c(i, 
+                             nrow(dataset %>% filter(quantile==i,dataset[[outcome]]==1)), 
+                             nrow(dataset %>% filter(quantile==i)))
+              table2[i,4:5] = c(table2[i-1,4]+table2[i,2], 
+                             table2[i-1,5]+table2[i,3])}
+  
+  table2[i,6] = table2[i,4]/nrow(dataset %>% filter(hcm==1))*100
+  
+  temp_table <- data.frame(matrix(ncol = 2, nrow = 2))
+  temp_table[1,] <- c(table2[i,4],nrow(dataset %>% filter(hcm==1)))
+  temp_table[2,] <- c(1,1)
+  colnames(temp_table) <- c('cum_n','total_n')
+  temp_table = as.matrix(temp_table)
+  
+  table2[i,7:8] = epi.conf(temp_table[,1:2], ctype = "prevalence", method = "exact", N = nrow(dataset %>% filter(hcm==1)), design = 1, 
+           conf.level = 0.95)[1,c(2,3)]
+  
+  table2[i,7:8] = table2[i,7:8]*100
+  }
+  
+colnames(table2) <- c('quantile','case_n','quantile_n','case_cum','overall_cum','cases_proportion','lci','uci')
+
+
+plot = ggplot(table2, aes(y=quantile, x=cases_proportion, xmin=lci, xmax=uci)) + 
+  geom_line(colour='black', aes(x = cases_proportion), size=1) +
+  geom_ribbon(aes(xmin=lci, xmax=uci, x=quantile), alpha = 0.2) +
+  geom_hline(yintercept = c(3, 16,50, 85, 98), linetype =3) +
+  scale_y_continuous(name="PRS centile in general population (%)", n.breaks = 10, minor_breaks=NULL) +
+  scale_x_continuous(name="Proportion of total HCM cases (%)", n.breaks = 10, minor_breaks=NULL) +
+  theme_minimal() +
+  theme(axis.text=element_text(size=14), axis.title = element_text(size=16))
+
+print(plot)
+}
+
+rm(data2, rare_var_data2, rare_var_plp2, rare_var_neg2)
+```
+
+##Assessment of PGS performance using linear regression, AUC and r2
+```{r Assessment of PGS performance using regression, AUC and r2, echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+df_list = list(data, rare_var_plp, rare_var_neg)
+names(df_list) <- c( substitute(data), substitute(rare_var_plp), substitute(rare_var_neg))
+
+library(pROC)
+
+for (i in 1:length(df_list)){
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+#perform lin reg (PRS as continuous variable)
+variables <- c('PRS','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5','pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+outcome <- 'hcm'
+
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+print(summary(mylogit))
+
+std.dev <- sd(dataset$PRS)
+print(paste("OR per SD", exp(summary(mylogit)$coefficients[2,1]*std.dev)))
+print(paste("LCI per SD", exp((summary(mylogit)$coefficients[2,1]-summary(mylogit)$coefficients[2,2]*1.96)*std.dev)))
+print(paste("UCI per SD", exp((summary(mylogit)$coefficients[2,1]+summary(mylogit)$coefficients[2,2]*1.96)*std.dev)))
+
+#perform log reg (PRS as quantile)
+variables <- c('quantile','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5','pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+
+mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+print(summary(mylogit))
+print(paste("OR per decile", exp(summary(mylogit)$coefficients[2,1])))
+print(paste("LCI per decile", exp((summary(mylogit)$coefficients[2,1]-summary(mylogit)$coefficients[2,2]*1.96))))
+print(paste("UCI per decile", exp((summary(mylogit)$coefficients[2,1]+summary(mylogit)$coefficients[2,2]*1.96))))
+
+#calculate AUC
+set.seed(1)
+sample <- sample(c(TRUE, FALSE), nrow(dataset), replace=TRUE, prob=c(0.7,0.3))
+train <- dataset[sample, ]
+test <- dataset[!sample, ] 
+
+model <-  glm(lm_formula, data = train, family = "binomial")
+predicted <- predict(model, test, type="response")
+print(auc(test[[outcome]], predicted))
+}
+```
+
+##Comparing risk of PGS across a range of quantiles
+Comparing top vs. median
+```{r Comparing range of quantiles (vs. median), echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(pROC)
+
+outcome <- 'hcm'
+variables <- c('high','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5', 'pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+quantile_list <- c(2,3,4,5,10, 20, 50, 100, 200, 400,500, 1000)
+comparator = 'median'
+
+table_names <- c('outcome','quantile', 'or', 'lci','uci','pvalue')
+table <- as.data.frame(matrix(ncol=length(table_names), nrow = (length(quantile_list))))
+colnames(table) <- table_names
+
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+
+for (i in 1:length(quantile_list)){
+  quantiles <- quantile_list[i]
+  
+  data$quantile <- ntile(data$PRS, 1000) #group individuals into quantiles
+  
+
+    if (comparator=='bottom'){dataset <- data %>% filter(quantile <= 100 | quantile> (1000/quantiles*(quantiles-1)))}
+    if (comparator=='median'){
+      if (quantiles == 2){dataset = data %>% filter(quantile <= 1000/quantiles | quantile> 1000/quantiles)}#filter only SARCPLP positive carriers
+      if (quantiles >2){dataset <- data %>% filter((quantile >400 & quantile<=600) | quantile> (1000/quantiles*(quantiles-1)))}
+      }
+    
+    dataset$high <- ifelse(dataset$quantile > (1000/quantiles*(quantiles-1)), 1, 0)
+    
+    mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+  
+  table[i,] <- c(outcome, quantiles,
+                 round(exp(summary(mylogit)$coefficients['high','Estimate']),digits=2), 
+                 round(exp(summary(mylogit)$coefficients['high','Estimate']-(summary(mylogit)$coefficients['high','Std. Error']*1.96)), digits=2), 
+                 round(exp(summary(mylogit)$coefficients['high','Estimate']+(summary(mylogit)$coefficients['high','Std. Error']*1.96)), digits=2), 
+                 signif(summary(mylogit)$coefficients['high','Pr(>|z|)']),digits=2)
+}
+knitr::kable(table, caption='HCM risk across a range of quantiles, comparing top with median quintile')
+```
+Comparing top vs. bottom
+```{r Comparing range of quantiles (vs. bottom), echo=FALSE, message=FALSE, warning=FALSE, paged.print=FALSE}
+library(pROC)
+
+outcome <- 'hcm'
+variables <- c('high','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5', 'pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+quantile_list <- c(2,3,4,5,10, 20, 50, 100, 200, 400,500, 1000)
+comparator = 'bottom'
+
+table_names <- c('outcome','quantile', 'or', 'lci','uci','pvalue')
+table <- as.data.frame(matrix(ncol=length(table_names), nrow = (length(quantile_list))))
+colnames(table) <- table_names
+
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+
+for (i in 1:length(quantile_list)){
+  quantiles <- quantile_list[i]
+  
+  data$quantile <- ntile(data$PRS, 1000) #group individuals into quantiles
+  
+  dataset <- data %>% filter(quantile <= 100 | quantile> (1000/quantiles*(quantiles-1)))
+    
+    dataset$high <- ifelse(dataset$quantile > (1000/quantiles*(quantiles-1)), 1, 0)
+    
+    mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+  
+  table[i,] <- c(outcome, quantiles,
+                 round(exp(summary(mylogit)$coefficients['high','Estimate']),digits=2), 
+                 round(exp(summary(mylogit)$coefficients['high','Estimate']-(summary(mylogit)$coefficients['high','Std. Error']*1.96)), digits=2), 
+                 round(exp(summary(mylogit)$coefficients['high','Estimate']+(summary(mylogit)$coefficients['high','Std. Error']*1.96)), digits=2), 
+                 signif(summary(mylogit)$coefficients['high','Pr(>|z|)']),digits=2)
+}
+knitr::kable(table, caption='HCM risk across a range of quantiles, comparing top with bottom decile')
+
+```
+##Common x Rare interaction
+```{r Rare*PGS interaction, echo=FALSE}
+outcome <- 'hcm'
+dataset <- rare_var_data 
+variables <- c('PRS*dataset[[variant_type]]','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5','pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+print(summary(mylogit))
+```
+
+
+
+##Clinical outcomes
+```{r Run through multiple quantile thresholds for all clinical outcomes, echo=FALS}
+dataset <- data
+dataset <- dataset %>% filter(dcm==0)
+quantile_list <- c(5,10,20,50,100)
+comparator = 'middle'
+clinical_outcome_list <- c('death','death_mace_no_arrhythmia_cardiomyopathy','mace_no_arrhythmia_cardiomyopathy','all_hcm_composite', 'hcm_hard_composite', 'cardiomyopathy_pooled', 'cardiac_arrest_death_icd', 'af_stroke',  'hf')
+exclude_case = FALSE
+exclude_dcm = FALSE
+rare_var_strat_analysis <- 'no' #'no' or 'yes'
+rare_var_plp_status <- 1 #or 0
+
+cox_variables <- c('high','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5', 'pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+
+table_names <- c('outcome','quantile', 'or', 'lci','uci','pvalue')
+table <- as.data.frame(matrix(ncol=length(table_names), nrow = (length(quantile_list)*length(clinical_outcome_list))))
+colnames(table) <- table_names
+
+if (exclude_case == TRUE){dataset <- dataset %>% filter(dataset[[outcome]] == 0)}
+if (exclude_dcm == TRUE){dataset <- dataset %>% filter(dcm == 0)}
+
+for (i in 1:length(quantile_list)){
+  
+  quantiles <- quantile_list[i]
+  dataset$quantile <- ntile(dataset$PRS, 100) #group individuals into quantiles
+  
+  dataset2=dataset
+  
+  if (comparator=='bottom'){dataset2 <- dataset2 %>% filter(quantile <= 20 | quantile>= (100*(quantiles-1)/quantiles))}
+  if (comparator=='median'){dataset2 = dataset2 %>% filter((quantile >= 40 & quantile <60)  | (quantile > 100*(quantiles-1)/quantiles))}
+      
+  if (rare_var_strat_analysis == 'yes') {
+    dataset2 <- dataset2 %>% filter(SARCPLP == rare_var_plp_status) %>% filter(quantile == 1 | quantile==quantiles)#filter only SARCPLP positive carriers
+    dataset2$high <- ifelse(dataset2$quantile > 100*(quantiles-1)/quantile, 1, 0) 
+  } else {
+    dataset2$high <- ifelse(dataset2$quantile > 100*(quantiles-1)/quantiles, 1, 0)
+  }
+  for (j in 1:length(clinical_outcome_list)){
+    clinical_outcome <- clinical_outcome_list[j]
+    
+    cox_formula <- as.formula(paste(paste('Surv(time_', clinical_outcome, ', event_', clinical_outcome, ')',sep=''), paste(cox_variables, collapse='+'), sep='~'))
+    
+    print(c(clinical_outcome, quantiles))
+    res.cox <- coxph(cox_formula, data=dataset2, robust=TRUE)
+    
+    table[i*length(clinical_outcome_list)-length(clinical_outcome_list)+j,] <- c(clinical_outcome, quantiles, round(summary(res.cox)$coefficients['high','exp(coef)'],digits = 2), round(exp(confint(res.cox)['high','97.5 %']),digits = 2),round(exp(confint(res.cox)['high','2.5 %']),digits = 2), signif(summary(res.cox)$coefficients['high','Pr(>|z|)'],digits = 2))
+  }
+}
+print(table)
+```
+
+
+```{r Clinical outcomes general code, echo=FALSE, fig.height=8, fig.width=12}
+dataset <- data 
+
+dataset <- dataset %>% filter(dcm==0)
+clinical_outcome <- 'cardiomyopathy'
+comparator = 'median' #median or low
+cox_variables <- c('PRS','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5', 'pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+cox_formula <- as.formula(paste(paste('Surv(time_', clinical_outcome, ', event_', clinical_outcome, ')',sep=''), paste(cox_variables, collapse='+'), sep='~'))
+res.cox <- coxph(cox_formula, data=dataset, robust=TRUE)
+print(res.cox)
+std.dev <- sd(dataset$PRS)
+exp(summary(res.cox)$coefficients[1,1]*std.dev)
+exp((summary(res.cox)$coefficients[1,1]-summary(res.cox)$coefficients[1,3]*1.96)*std.dev)
+exp((summary(res.cox)$coefficients[1,1]+summary(res.cox)$coefficients[1,3]*1.96)*std.dev)
+
+
+cox_variables <- c('high','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5', 'pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+if (comparator == 'median'){ dataset <- dataset %>% filter(quantile == quantiles | (quantile >quantiles*0.4 & quantile<=quantiles*0.6)) }
+if (comparator == 'low') {dataset <- dataset %>% filter(quantile == quantiles | quantile  == 1) }
+dataset$high = ifelse(dataset$quantile == quantiles, 1, 0)
+cox_formula <- as.formula(paste(paste('Surv(time_', clinical_outcome, ', event_', clinical_outcome, ')',sep=''), paste(cox_variables, collapse='+'), sep='~'))
+res.cox <- coxph(cox_formula, data=dataset, robust=TRUE)
+print(res.cox)
+std.dev <- sd(dataset$PRS)
+exp(summary(res.cox)$coefficients[1,1])
+exp((summary(res.cox)$coefficients[1,1]-summary(res.cox)$coefficients[1,3]*1.96))
+exp((summary(res.cox)$coefficients[1,1]+summary(res.cox)$coefficients[1,3]*1.96))
+
+
+#survival curve
+surv_variables <- 'high'
+surv_formula <- as.formula(paste(paste('Surv(time_', clinical_outcome, ', event_', clinical_outcome, ')',sep=''), paste(surv_variables, collapse='+'), sep='~'))
+fit <- surv_fit(surv_formula, data=dataset)
+
+plot <- ggsurvplot(fit, 
+                    xlab = "Years",
+                    ylab="Cumulative hazards of event", 
+                    #                   ylim=c(0,0.1),
+                    #                  xlim=c(0,80),
+                    legend='bottom', 
+                    legend.title = 'Genotype', font.legend=c(14),
+                    legend.labs = c('PGS median risk', 'PGS high risk'),
+                    palette=c("#fed976", "#bd0026"),
+                    risk.table = TRUE, risk.table.title = NULL, risk.table.height=0.20,
+                    linetype='strata',
+                    fontsize=4, font.x=14, font.y=14, font.tickslab=12,
+                    break.time.by = 10,
+                    break.y.by=0.01,
+                    fun='cumhaz',
+                    title=NULL)
+ggsurv$plot <- ggsurv$plot + theme(legend.text=element_text(size=14))
+print(ggsurv)
+```
+
+```{r Cumulative hazards plots for HCM diagnosis with three groups, echo=FALSE, fig.height=8, fig.width=12}
+dataset <- data
+clinical_outcome <- 'cardiomyopathy_pooled'
+dataset = dataset %>% filter(dcm == 0)
+surv_variables <- 'group'
+exclude_case = FALSE
+
+quantiles <- 100
+
+dataset$quantile <- ntile(dataset$PRS, quantiles) #group individuals into quantiles
+
+dataset <- dataset %>% filter((quantile<=quantiles*0.2)
+                              | quantile == quantiles 
+                              | quantile >quantiles*0.4 & quantile<=quantiles*0.6)
+
+dataset$group <- ifelse((dataset$quantile==quantiles), 3, ifelse
+                        ((dataset$quantile>quantiles*0.4 & dataset$quantile<=quantiles*0.6), 2, ifelse
+                          ((dataset$quantile < quantiles*0.2), 1, -9)))
+dataset <- dataset %>% filter(group != -9)
+
+for (i in 1:length(unique(dataset$group))){
+  dataset[[paste('var_',i,sep='')]] <- ifelse(dataset$group == i, 1, 0)
+}
+
+surv_formula <- as.formula(paste(paste('Surv(time_', clinical_outcome, ', event_', clinical_outcome, ')',sep=''), paste(surv_variables, collapse='+'), sep='~'))
+fit <- surv_fit(surv_formula, data=dataset)
+
+ggsurv<- ggsurvplot(fit, 
+                    ylim=c(0,0.05),
+                    xlim=c(0,80),
+                    xlab = "Years",
+                    ylab="Cumulative incidence of HCM", 
+                    legend='bottom', 
+                    legend.title = 'PGS Risk', font.legend=c(14),
+                    legend.labs = c('Low <20%', 'Median 40-60%','High >99%'),
+                    palette=c('#fed976',"#fd8d3c", '#bd0026'),
+                    risk.table = TRUE, risk.table.title = NULL, risk.table.height=0.20,
+                    linetype='strata',
+                    fontsize=4, font.x=12, font.y=12, font.tickslab=10,
+                    break.time.by = 10,
+                    fun='cumhaz',
+                    break.y.by=0.01,
+                    title=NULL)
+ggsurv$plot <- ggsurv$plot + theme(legend.text=element_text(size=10))
+ggsurv
+```
+
+
+```{r Cumulative hazards plots for DCM diagnosis with three groups, echo=FALSE, fig.height=8, fig.width=12}
+dataset <- data
+clinical_outcome <- 'cardiomyopathy_pooled'
+dataset = dataset %>% filter(hcm == 0)
+surv_variables <- 'group'
+exclude_case = FALSE
+
+quantiles <- 100
+
+dataset$quantile <- ntile(dataset$PRS, quantiles) #group individuals into quantiles
+
+dataset <- dataset %>% filter((quantile < quantiles*0.1)
+                              | quantile > quantiles*0.9 
+                              | quantile >quantiles*0.4 & quantile<=quantiles*0.6)
+
+dataset$group <- ifelse((dataset$quantile > quantiles*0.9), 3, ifelse
+                        ((dataset$quantile>quantiles*0.4 & dataset$quantile<=quantiles*0.6), 2, ifelse
+                          ((dataset$quantile < quantiles*0.1), 1, -9)))
+dataset <- dataset %>% filter(group != -9)
+
+for (i in 1:length(unique(dataset$group))){
+  dataset[[paste('var_',i,sep='')]] <- ifelse(dataset$group == i, 1, 0)
+}
+
+surv_formula <- as.formula(paste(paste('Surv(time_', clinical_outcome, ', event_', clinical_outcome, ')',sep=''), paste(surv_variables, collapse='+'), sep='~'))
+fit <- surv_fit(surv_formula, data=dataset)
+
+ggsurv<- ggsurvplot(fit, 
+                    ylim=c(0,0.02),
+                    xlim=c(0,80),
+                    xlab = "Years",
+                    ylab="Cumulative incidence of DCM", 
+                    legend='bottom', 
+                    legend.title = 'PGS Risk', font.legend=c(14),
+                    legend.labs = c('Low <10%', 'Median 40-60%','High >10%'),
+                    palette=c('#fed976',"#fd8d3c", '#bd0026'),
+                    risk.table = TRUE, risk.table.title = NULL, risk.table.height=0.20,
+                    linetype='strata',
+                    fontsize=4, font.x=12, font.y=12, font.tickslab=10,
+                    break.time.by = 10,
+                    fun='cumhaz',
+                    break.y.by=0.01,
+                    title=NULL)
+ggsurv$plot <- ggsurv$plot + theme(legend.text=element_text(size=10))
+print(ggsurv)
+pdf(paste('/Volumes/RDS/project/lms-ware-analysis/live/sean/prs/PRScs/HCM/figures/clinical_outcomes/',phenotype,'.',mybpc3_status,'.PRScs.',prscs_method,'.survival.DCM.topcentile.median.pdf', sep=''),width=12,height=8, useDingbats = F, onefile = F)
+ggsurv
+dev.off()
+```
+
+
+```{r Prevalence of DCM in unequal bin sizes, echo=FALSE, fig.height=8, fig.width=8}
+df_list = list(data)
+names(df_list) <- c( substitute(data))
+outcome = 'dcm'
+
+for (i in 1:length(df_list)) {
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+quantiles <- 100
+dataset$quantile <- ntile(dataset$PRS, quantiles) #group individuals into quantiles
+
+dataset$quantile0_1 = ifelse(dataset$quantile <=1, 1, 0)
+dataset$quantile1_5 = ifelse(dataset$quantile >1 & dataset$quantile <=5, 1, 0)
+dataset$quantile5_10= ifelse(dataset$quantile >5 & dataset$quantile <=10, 1, 0)
+dataset$quantile10_20= ifelse(dataset$quantile >10 & dataset$quantile <=20, 1, 0)
+dataset$quantile20_40= ifelse(dataset$quantile >20 & dataset$quantile <=40, 1, 0)
+dataset$quantile40_60= ifelse(dataset$quantile >40 & dataset$quantile <=60, 1, 0)
+dataset$quantile60_80= ifelse(dataset$quantile >60 & dataset$quantile <=80, 1, 0)
+dataset$quantile80_90= ifelse(dataset$quantile >80 & dataset$quantile <=90, 1, 0)
+dataset$quantile90_95= ifelse(dataset$quantile >90 & dataset$quantile <=95, 1, 0)
+dataset$quantile95_99= ifelse(dataset$quantile >95 & dataset$quantile <=99, 1, 0)
+dataset$quantile99_100 = ifelse(dataset$quantile >99, 1, 0)
+
+table <- data.frame(matrix(ncol = 3, nrow = 11))
+colnames(table) <- c('percentile','case','control')
+quantile_cols <- c('quantile0_1','quantile1_5','quantile5_10','quantile10_20','quantile20_40','quantile40_60','quantile60_80','quantile80_90','quantile90_95','quantile95_99','quantile99_100')
+
+for (i in 1:length(quantile_cols)){
+  table[i,] <- c(i, as.numeric(nrow(dataset %>% filter(dataset[[quantile_cols[i]]]==1 & dataset[[outcome]]==1))), as.numeric(nrow(dataset %>% filter(dataset[[quantile_cols[i]]]==1 & dataset[[outcome]]==0))))
+}
+
+table1 <- as.matrix(table)
+table2 <- epi.conf(table1[,2:3], ctype = "prevalence", method = "exact", N = 1000, design = 1, 
+                   conf.level = 0.95) * 1000
+table2$quantiles <- 1:11
+
+plot = ggplot(data=table2, aes(x=quantiles, y=est)) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.25) +
+  geom_point(size=2.5) +
+  scale_y_continuous(name='HCM Prevalence (cases per 1000 individuals at risk)', breaks = c(2,4,6,8,10,12,14,16)) +
+  scale_x_continuous(name='PRS quantile', breaks=c(1:100)) +
+  theme_classic() +
+  theme(axis.text=element_text(size=14),
+        axis.title = element_text(size=16))
+
+print(plot)
+
+pdf('/Volumes/RDS/project/lms-ware-analysis/live/sean/prs/PRScs/HCM/figures/prevalence/HCM.MTAG.exc.MYBPC3.PRScs.1KG.LD.UKB.DCM.prevalence.unequal.bins.pdf',width=8,height=8, useDingbats = F)
+plot
+dev.off()
+
+}
+```
+
+
+```{r OR in unequal bin sizes compared with middle, echo=FALSE, fig.height=8, fig.width=8}
+
+df_list = list(data)
+names(df_list) <- c( substitute(data))
+outcome = 'dcm'
+
+for (i in 1:length(df_list)) {
+dataset <- df_list[[i]]
+print(names(df_list[i]))
+
+quantiles <- 100
+dataset$quantile <- ntile(dataset$PRS, quantiles) #group individuals into quantiles
+
+dataset$quantile0_1 = ifelse(dataset$quantile <=1, 1, 0)
+dataset$quantile1_5 = ifelse(dataset$quantile >1 & dataset$quantile <=5, 1, 0)
+dataset$quantile5_10= ifelse(dataset$quantile >5 & dataset$quantile <=10, 1, 0)
+dataset$quantile10_20= ifelse(dataset$quantile >10 & dataset$quantile <=20, 1, 0)
+dataset$quantile20_40= ifelse(dataset$quantile >20 & dataset$quantile <=40, 1, 0)
+dataset$quantile40_60= ifelse(dataset$quantile >40 & dataset$quantile <=60, 1, 0)
+dataset$quantile60_80= ifelse(dataset$quantile >60 & dataset$quantile <=80, 1, 0)
+dataset$quantile80_90= ifelse(dataset$quantile >80 & dataset$quantile <=90, 1, 0)
+dataset$quantile90_95= ifelse(dataset$quantile >90 & dataset$quantile <=95, 1, 0)
+dataset$quantile95_99= ifelse(dataset$quantile >95 & dataset$quantile <=99, 1, 0)
+dataset$quantile99_100 = ifelse(dataset$quantile >99, 1, 0)
+
+variables <- c('quantile0_1','quantile1_5','quantile5_10','quantile10_20','quantile20_40','quantile60_80','quantile80_90','quantile90_95','quantile95_99','quantile99_100','age', 'age2','sex', 'pc1', 'pc2', 'pc3', 'pc4', 'pc5','pc6', 'pc7', 'pc8', 'pc9', 'pc10')
+lm_formula <- as.formula(paste(outcome, paste(variables, collapse='+'), sep='~'))
+mylogit <- glm(lm_formula, data = dataset, family = "binomial")
+print(summary(mylogit))
+
+estimates = as.data.frame(summary(mylogit)$coefficients[2:11,1:2])
+estimates$OR = exp(estimates[,'Estimate'])
+estimates$LCI = exp(estimates[,'Estimate']-(1.96*estimates[,'Std. Error']))
+estimates$UCI = exp(estimates[,'Estimate']+(1.96*estimates[,'Std. Error']))
+
+
+estimates <- estimates[c('quantile0_1','quantile1_5','quantile5_10','quantile10_20','quantile20_40',10,'quantile60_80','quantile80_90','quantile90_95','quantile95_99','quantile99_100'),]
+estimates[6,]=c(1,1,1,1,1)
+estimates$quantiles <- 1:11
+estimates[,1:2] = NULL
+colnames(estimates) <- c('OR', 'LCI', 'UCI', 'quantiles')
+
+knitr::kable(estimates, caption = 'OR in unequal bin sizes compared with middle')
+
+plot = ggplot(data=estimates, aes(x=quantiles, y=OR)) +
+  geom_errorbar(aes(ymin=LCI, ymax=UCI), width=0.25) +
+  geom_point(size=2.5) +
+  scale_y_continuous(name='Odds Ratio for DCM', breaks=1:100) +
+  scale_x_continuous(name='PGS Quantile', breaks=1:quantiles) +
+  theme_classic() +
+  theme(axis.text=element_text(size=14),
+        axis.title = element_text(size=16)) +
+  geom_hline(yintercept=1,linetype=2)
+print(estimates)
+print(plot)
+pdf('/Volumes/RDS/project/lms-ware-analysis/live/sean/prs/PRScs/HCM/figures/or/HCM.MTAG.exc.MYBPC3.PRScs.1KG.LD.UKB.DCM.prevalence.unequal.bins.pdf',width=8,height=8, useDingbats = F)
+plot
+dev.off()
+
+
+}
+
+```
+
